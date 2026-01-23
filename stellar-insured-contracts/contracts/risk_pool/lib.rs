@@ -9,6 +9,8 @@ const PAUSED: Symbol = Symbol::short("PAUSED");
 const CONFIG: Symbol = Symbol::short("CONFIG");
 const POOL_STATS: Symbol = Symbol::short("POOL_ST");
 const PROVIDER: Symbol = Symbol::short("PROVIDER");
+const RESERVED_TOTAL: Symbol = Symbol::short("RSV_TOT");
+const CLAIM_RESERVATION: Symbol = Symbol::short("CLM_RSV");
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -39,6 +41,19 @@ fn set_paused(env: &Env, paused: bool) {
     env.storage()
         .persistent()
         .set(&PAUSED, &paused);
+}
+
+fn require_reservation_admin(env: &Env) -> Result<Address, ContractError> {
+    let admin: Address = env
+        .storage()
+        .persistent()
+        .get(&ADMIN)
+        .ok_or(ContractError::NotInitialized)?;
+    let invoker = env.invoker();
+    if invoker != admin {
+        return Err(ContractError::Unauthorized);
+    }
+    Ok(admin)
 }
 
 #[contractimpl]
@@ -139,6 +154,120 @@ impl RiskPoolContract {
         Ok(provider_info)
     }
 
+    pub fn reserve_liquidity(env: Env, claim_id: u64, amount: i128) -> Result<(), ContractError> {
+        require_reservation_admin(&env)?;
+
+        if is_paused(&env) {
+            return Err(ContractError::Paused);
+        }
+
+        if amount <= 0 {
+            return Err(ContractError::InvalidInput);
+        }
+
+        if env
+            .storage()
+            .persistent()
+            .has(&(CLAIM_RESERVATION, claim_id))
+        {
+            return Err(ContractError::AlreadyExists);
+        }
+
+        let stats: (i128, i128, i128, u64) = env
+            .storage()
+            .persistent()
+            .get(&POOL_STATS)
+            .ok_or(ContractError::NotFound)?;
+
+        let reserved_total: i128 = env
+            .storage()
+            .persistent()
+            .get(&RESERVED_TOTAL)
+            .unwrap_or(0i128);
+
+        let available = stats.0 - reserved_total;
+        if available < amount {
+            return Err(ContractError::InsufficientFunds);
+        }
+
+        let new_reserved_total = reserved_total + amount;
+
+        env.storage()
+            .persistent()
+            .set(&RESERVED_TOTAL, &new_reserved_total);
+        env.storage()
+            .persistent()
+            .set(&(CLAIM_RESERVATION, claim_id), &amount);
+
+        env.events().publish(
+            (Symbol::new(&env, "liquidity_reserved"), claim_id),
+            (amount, new_reserved_total),
+        );
+
+        Ok(())
+    }
+
+    pub fn payout_reserved_claim(env: Env, claim_id: u64, recipient: Address) -> Result<(), ContractError> {
+        require_reservation_admin(&env)?;
+
+        if is_paused(&env) {
+            return Err(ContractError::Paused);
+        }
+
+        validate_address(&env, &recipient)?;
+
+        let mut stats: (i128, i128, i128, u64) = env
+            .storage()
+            .persistent()
+            .get(&POOL_STATS)
+            .ok_or(ContractError::NotFound)?;
+
+        let mut reserved_total: i128 = env
+            .storage()
+            .persistent()
+            .get(&RESERVED_TOTAL)
+            .unwrap_or(0i128);
+
+        let amount: i128 = env
+            .storage()
+            .persistent()
+            .get(&(CLAIM_RESERVATION, claim_id))
+            .ok_or(ContractError::NotFound)?;
+
+        if amount <= 0 {
+            return Err(ContractError::InvalidState);
+        }
+
+        if reserved_total < amount {
+            return Err(ContractError::InvalidState);
+        }
+
+        if stats.0 < amount {
+            return Err(ContractError::InsufficientFunds);
+        }
+
+        reserved_total -= amount;
+        stats.0 -= amount;
+        stats.1 += amount;
+
+        env.storage()
+            .persistent()
+            .set(&RESERVED_TOTAL, &reserved_total);
+        env.storage()
+            .persistent()
+            .remove(&(CLAIM_RESERVATION, claim_id));
+        env.storage()
+            .persistent()
+            .set(&POOL_STATS, &stats);
+
+        env.events().publish(
+            (Symbol::new(&env, "reserved_claim_payout"), claim_id),
+            (recipient, amount),
+        );
+
+        Ok(())
+    }
+
     pub fn payout_claim(env: Env, recipient: Address, amount: i128) -> Result<(), ContractError> {
         let admin: Address = env
             .storage()
@@ -165,8 +294,13 @@ impl RiskPoolContract {
             .persistent()
             .get(&POOL_STATS)
             .ok_or(ContractError::NotFound)?;
+        let reserved_total: i128 = env
+            .storage()
+            .persistent()
+            .get(&RESERVED_TOTAL)
+            .unwrap_or(0i128);
 
-        if stats.0 < amount {
+        if stats.0 - reserved_total < amount {
             return Err(ContractError::InsufficientFunds);
         }
 
