@@ -5,6 +5,21 @@
 
 use soroban_sdk::{contracttype, Address, Env, Symbol, String};
 
+/// Re-export authorization module for easy access
+/// Import authorization functions like: use insurance_contracts::authorization::*;
+pub mod authorization {
+    pub use authorization::{
+        Role, RoleKey, AuthError,
+        initialize_admin, get_admin, grant_role, revoke_role, get_role,
+        has_role, require_role, require_admin, has_any_role, require_any_role,
+        require_policy_management, require_claim_processing,
+        require_risk_pool_management, require_governance_permission,
+        register_trusted_contract, unregister_trusted_contract,
+        is_trusted_contract, require_trusted_contract,
+        verify_and_require_role, verify_and_check_permission,
+    };
+}
+
 /// Common contract types shared across all insurance contracts
 pub mod types {
     use super::*;
@@ -86,6 +101,24 @@ pub mod errors {
         NotInitialized = 9,
         /// Already initialized
         AlreadyInitialized = 10,
+        /// Invalid role or permission
+        InvalidRole = 11,
+        /// Role not found
+        RoleNotFound = 12,
+        /// Contract not trusted for cross-contract calls
+        NotTrustedContract = 13,
+    }
+    
+    /// Convert authorization errors to contract errors
+    impl From<super::authorization::AuthError> for ContractError {
+        fn from(err: super::authorization::AuthError) -> Self {
+            match err {
+                super::authorization::AuthError::Unauthorized => ContractError::Unauthorized,
+                super::authorization::AuthError::InvalidRole => ContractError::InvalidRole,
+                super::authorization::AuthError::RoleNotFound => ContractError::RoleNotFound,
+                super::authorization::AuthError::NotTrustedContract => ContractError::NotTrustedContract,
+            }
+        }
     }
 }
 
