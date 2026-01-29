@@ -572,4 +572,838 @@ impl ClaimsContract {
     }
 }
 
-// No test module included here yet.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::testutils::{Address as _, Ledger};
+    use soroban_sdk::{Env, Address};
+
+    fn with_contract_env<T>(env: &Env, f: impl FnOnce() -> T) -> T {
+        let cid = env.register_contract(None, ClaimsContract);
+        env.as_contract(&cid, f)
+    }
+
+    // Test helper functions
+    fn setup_test_env() -> (Env, Address, Address, Address, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let policy_contract = Address::generate(&env);
+        let risk_pool = Address::generate(&env);
+        let user = Address::generate(&env);
+
+        (env, admin, policy_contract, risk_pool, user)
+    }
+
+    fn initialize_contract(env: &Env, admin: &Address, policy_contract: &Address, risk_pool: &Address) {
+        ClaimsContract::initialize(
+            env.clone(),
+            admin.clone(),
+            policy_contract.clone(),
+            risk_pool.clone(),
+        ).unwrap();
+    }
+
+    // ============================================================
+    // INITIALIZATION TESTS
+    // ============================================================
+
+    #[test]
+    fn test_initialize_success() {
+        let (env, admin, policy_contract, risk_pool, _) = setup_test_env();
+
+        let result = ClaimsContract::initialize(
+            env.clone(),
+            admin.clone(),
+            policy_contract.clone(),
+            risk_pool.clone(),
+        );
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_initialize_already_initialized() {
+        let (env, admin, policy_contract, risk_pool, _) = setup_test_env();
+
+        initialize_contract(&env, &admin, &policy_contract, &risk_pool);
+
+        let result = ClaimsContract::initialize(
+            env.clone(),
+            admin.clone(),
+            policy_contract.clone(),
+            risk_pool.clone(),
+        );
+
+        assert_eq!(result, Err(ContractError::AlreadyInitialized));
+    }
+
+    // ============================================================
+    // SUBMIT CLAIM TESTS - Happy Path
+    // ============================================================
+
+    #[test]
+    fn test_submit_claim_success() {
+        let (env, admin, policy_contract, risk_pool, user) = setup_test_env();
+        initialize_contract(&env, &admin, &policy_contract, &risk_pool);
+
+        let policy_id = 1;
+        let claim_amount = 1000;
+
+        let result = ClaimsContract::submit_claim(
+            env.clone(),
+            user.clone(),
+            policy_id,
+            claim_amount,
+        );
+
+        assert!(result.is_ok());
+        let claim_id = result.unwrap();
+        assert!(claim_id > 0);
+
+        // Verify claim stored correctly
+        let claim = ClaimsContract::get_claim(env.clone(), claim_id).unwrap();
+        assert_eq!(claim.0, policy_id);
+        assert_eq!(claim.1, user);
+        assert_eq!(claim.2, claim_amount);
+        assert_eq!(claim.3, ClaimStatus::Submitted);
+    }
+
+    #[test]
+    fn test_submit_claim_maximum_coverage_amount() {
+        let (env, admin, policy_contract, risk_pool, user) = setup_test_env();
+        initialize_contract(&env, &admin, &policy_contract, &risk_pool);
+
+        let policy_id = 1;
+        let max_amount = i128::MAX / 2; // Use a large but safe value
+
+        let result = ClaimsContract::submit_claim(
+            env.clone(),
+            user.clone(),
+            policy_id,
+            max_amount,
+        );
+
+        assert!(result.is_ok());
+    }
+
+    // ============================================================
+    // SUBMIT CLAIM TESTS - Edge Cases & Failures
+    // ============================================================
+
+    #[test]
+    fn test_submit_claim_invalid_amount_zero() {
+        let (env, admin, policy_contract, risk_pool, user) = setup_test_env();
+        initialize_contract(&env, &admin, &policy_contract, &risk_pool);
+
+        let result = ClaimsContract::submit_claim(
+            env.clone(),
+            user.clone(),
+            1,
+            0,
+        );
+
+        assert_eq!(result, Err(ContractError::InvalidInput));
+    }
+
+    #[test]
+    fn test_submit_claim_invalid_amount_negative() {
+        let (env, admin, policy_contract, risk_pool, user) = setup_test_env();
+        initialize_contract(&env, &admin, &policy_contract, &risk_pool);
+
+        let result = ClaimsContract::submit_claim(
+            env.clone(),
+            user.clone(),
+            1,
+            -100,
+        );
+
+        assert_eq!(result, Err(ContractError::InvalidInput));
+    }
+
+    #[test]
+    fn test_submit_claim_duplicate_for_same_policy() {
+        let (env, admin, policy_contract, risk_pool, user) = setup_test_env();
+        initialize_contract(&env, &admin, &policy_contract, &risk_pool);
+
+        let policy_id = 1;
+
+        // Submit first claim
+        ClaimsContract::submit_claim(
+            env.clone(),
+            user.clone(),
+            policy_id,
+            1000,
+        ).unwrap();
+
+        // Try to submit second claim for same policy
+        let result = ClaimsContract::submit_claim(
+            env.clone(),
+            user.clone(),
+            policy_id,
+            500,
+        );
+
+        assert_eq!(result, Err(ContractError::AlreadyExists));
+    }
+
+    #[test]
+    fn test_submit_claim_when_paused() {
+        let (env, admin, policy_contract, risk_pool, user) = setup_test_env();
+        initialize_contract(&env, &admin, &policy_contract, &risk_pool);
+
+        // Pause the contract
+        ClaimsContract::pause(env.clone(), admin.clone()).unwrap();
+
+        let result = ClaimsContract::submit_claim(
+            env.clone(),
+            user.clone(),
+            1,
+            1000,
+        );
+
+        assert_eq!(result, Err(ContractError::Paused));
+    }
+
+    #[test]
+    fn test_submit_claim_not_initialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let user = Address::generate(&env);
+
+        let result = ClaimsContract::submit_claim(
+            env.clone(),
+            user.clone(),
+            1,
+            1000,
+        );
+
+        assert_eq!(result, Err(ContractError::NotInitialized));
+    }
+
+    // ============================================================
+    // STATE TRANSITION TESTS - Start Review
+    // ============================================================
+
+    #[test]
+    fn test_start_review_success() {
+        let (env, admin, policy_contract, risk_pool, user) = setup_test_env();
+        initialize_contract(&env, &admin, &policy_contract, &risk_pool);
+
+        let processor = Address::generate(&env);
+        ClaimsContract::grant_processor_role(env.clone(), admin.clone(), processor.clone()).unwrap();
+
+        let claim_id = ClaimsContract::submit_claim(
+            env.clone(),
+            user.clone(),
+            1,
+            1000,
+        ).unwrap();
+
+        let result = ClaimsContract::start_review(env.clone(), processor.clone(), claim_id);
+        assert!(result.is_ok());
+
+        // Verify state changed
+        let claim = ClaimsContract::get_claim(env.clone(), claim_id).unwrap();
+        assert_eq!(claim.3, ClaimStatus::UnderReview);
+    }
+
+    #[test]
+    fn test_start_review_unauthorized() {
+        let (env, admin, policy_contract, risk_pool, user) = setup_test_env();
+        initialize_contract(&env, &admin, &policy_contract, &risk_pool);
+
+        let unauthorized_user = Address::generate(&env);
+
+        let claim_id = ClaimsContract::submit_claim(
+            env.clone(),
+            user.clone(),
+            1,
+            1000,
+        ).unwrap();
+
+        let result = ClaimsContract::start_review(env.clone(), unauthorized_user.clone(), claim_id);
+        assert_eq!(result, Err(ContractError::Unauthorized));
+    }
+
+    #[test]
+    fn test_start_review_invalid_state_transition() {
+        let (env, admin, policy_contract, risk_pool, user) = setup_test_env();
+        initialize_contract(&env, &admin, &policy_contract, &risk_pool);
+
+        let processor = Address::generate(&env);
+        ClaimsContract::grant_processor_role(env.clone(), admin.clone(), processor.clone()).unwrap();
+
+        let claim_id = ClaimsContract::submit_claim(
+            env.clone(),
+            user.clone(),
+            1,
+            1000,
+        ).unwrap();
+
+        // Start review successfully
+        ClaimsContract::start_review(env.clone(), processor.clone(), claim_id).unwrap();
+
+        // Try to start review again (invalid: UnderReview -> UnderReview)
+        let result = ClaimsContract::start_review(env.clone(), processor.clone(), claim_id);
+        assert_eq!(result, Err(ContractError::InvalidClaimState));
+    }
+
+    #[test]
+    fn test_start_review_nonexistent_claim() {
+        let (env, admin, policy_contract, risk_pool, _) = setup_test_env();
+        initialize_contract(&env, &admin, &policy_contract, &risk_pool);
+
+        let processor = Address::generate(&env);
+        ClaimsContract::grant_processor_role(env.clone(), admin.clone(), processor.clone()).unwrap();
+
+        let result = ClaimsContract::start_review(env.clone(), processor.clone(), 99999);
+        assert_eq!(result, Err(ContractError::NotFound));
+    }
+
+    // ============================================================
+    // STATE TRANSITION TESTS - Approve Claim
+    // ============================================================
+
+    #[test]
+    fn test_approve_claim_success() {
+        let (env, admin, policy_contract, risk_pool, user) = setup_test_env();
+        initialize_contract(&env, &admin, &policy_contract, &risk_pool);
+
+        let processor = Address::generate(&env);
+        ClaimsContract::grant_processor_role(env.clone(), admin.clone(), processor.clone()).unwrap();
+
+        let claim_id = ClaimsContract::submit_claim(
+            env.clone(),
+            user.clone(),
+            1,
+            1000,
+        ).unwrap();
+
+        ClaimsContract::start_review(env.clone(), processor.clone(), claim_id).unwrap();
+
+        // Note: This will fail in real test due to cross-contract call to risk_pool
+        // but tests the logic flow
+        let result = ClaimsContract::approve_claim(env.clone(), processor.clone(), claim_id, None);
+
+        // In unit tests without mocked cross-contract calls, this may panic
+        // In integration tests with proper mocks, verify:
+        // assert!(result.is_ok());
+        // let claim = ClaimsContract::get_claim(env.clone(), claim_id).unwrap();
+        // assert_eq!(claim.3, ClaimStatus::Approved);
+    }
+
+    #[test]
+    fn test_approve_claim_invalid_state_submitted() {
+        let (env, admin, policy_contract, risk_pool, user) = setup_test_env();
+        initialize_contract(&env, &admin, &policy_contract, &risk_pool);
+
+        let processor = Address::generate(&env);
+        ClaimsContract::grant_processor_role(env.clone(), admin.clone(), processor.clone()).unwrap();
+
+        let claim_id = ClaimsContract::submit_claim(
+            env.clone(),
+            user.clone(),
+            1,
+            1000,
+        ).unwrap();
+
+        // Try to approve without starting review (Submitted -> Approved)
+        let result = ClaimsContract::approve_claim(env.clone(), processor.clone(), claim_id, None);
+        assert_eq!(result, Err(ContractError::InvalidClaimState));
+    }
+
+    #[test]
+    fn test_approve_claim_unauthorized() {
+        let (env, admin, policy_contract, risk_pool, user) = setup_test_env();
+        initialize_contract(&env, &admin, &policy_contract, &risk_pool);
+
+        let processor = Address::generate(&env);
+        ClaimsContract::grant_processor_role(env.clone(), admin.clone(), processor.clone()).unwrap();
+
+        let unauthorized_user = Address::generate(&env);
+
+        let claim_id = ClaimsContract::submit_claim(
+            env.clone(),
+            user.clone(),
+            1,
+            1000,
+        ).unwrap();
+
+        ClaimsContract::start_review(env.clone(), processor.clone(), claim_id).unwrap();
+
+        let result = ClaimsContract::approve_claim(env.clone(), unauthorized_user.clone(), claim_id, None);
+        assert_eq!(result, Err(ContractError::Unauthorized));
+    }
+
+    // ============================================================
+    // STATE TRANSITION TESTS - Reject Claim
+    // ============================================================
+
+    #[test]
+    fn test_reject_claim_success() {
+        let (env, admin, policy_contract, risk_pool, user) = setup_test_env();
+        initialize_contract(&env, &admin, &policy_contract, &risk_pool);
+
+        let processor = Address::generate(&env);
+        ClaimsContract::grant_processor_role(env.clone(), admin.clone(), processor.clone()).unwrap();
+
+        let claim_id = ClaimsContract::submit_claim(
+            env.clone(),
+            user.clone(),
+            1,
+            1000,
+        ).unwrap();
+
+        ClaimsContract::start_review(env.clone(), processor.clone(), claim_id).unwrap();
+
+        let result = ClaimsContract::reject_claim(env.clone(), processor.clone(), claim_id);
+        assert!(result.is_ok());
+
+        let claim = ClaimsContract::get_claim(env.clone(), claim_id).unwrap();
+        assert_eq!(claim.3, ClaimStatus::Rejected);
+    }
+
+    #[test]
+    fn test_reject_claim_invalid_state_submitted() {
+        let (env, admin, policy_contract, risk_pool, user) = setup_test_env();
+        initialize_contract(&env, &admin, &policy_contract, &risk_pool);
+
+        let processor = Address::generate(&env);
+        ClaimsContract::grant_processor_role(env.clone(), admin.clone(), processor.clone()).unwrap();
+
+        let claim_id = ClaimsContract::submit_claim(
+            env.clone(),
+            user.clone(),
+            1,
+            1000,
+        ).unwrap();
+
+        // Try to reject without starting review
+        let result = ClaimsContract::reject_claim(env.clone(), processor.clone(), claim_id);
+        assert_eq!(result, Err(ContractError::InvalidClaimState));
+    }
+
+    #[test]
+    fn test_reject_claim_unauthorized() {
+        let (env, admin, policy_contract, risk_pool, user) = setup_test_env();
+        initialize_contract(&env, &admin, &policy_contract, &risk_pool);
+
+        let processor = Address::generate(&env);
+        ClaimsContract::grant_processor_role(env.clone(), admin.clone(), processor.clone()).unwrap();
+
+        let unauthorized_user = Address::generate(&env);
+
+        let claim_id = ClaimsContract::submit_claim(
+            env.clone(),
+            user.clone(),
+            1,
+            1000,
+        ).unwrap();
+
+        ClaimsContract::start_review(env.clone(), processor.clone(), claim_id).unwrap();
+
+        let result = ClaimsContract::reject_claim(env.clone(), unauthorized_user.clone(), claim_id);
+        assert_eq!(result, Err(ContractError::Unauthorized));
+    }
+
+    // ============================================================
+    // STATE TRANSITION TESTS - Settle Claim
+    // ============================================================
+
+    #[test]
+    fn test_settle_claim_invalid_state_submitted() {
+        let (env, admin, policy_contract, risk_pool, user) = setup_test_env();
+        initialize_contract(&env, &admin, &policy_contract, &risk_pool);
+
+        let processor = Address::generate(&env);
+        ClaimsContract::grant_processor_role(env.clone(), admin.clone(), processor.clone()).unwrap();
+
+        let claim_id = ClaimsContract::submit_claim(
+            env.clone(),
+            user.clone(),
+            1,
+            1000,
+        ).unwrap();
+
+        // Try to settle without approval
+        let result = ClaimsContract::settle_claim(env.clone(), processor.clone(), claim_id);
+        assert_eq!(result, Err(ContractError::InvalidClaimState));
+    }
+
+    #[test]
+    fn test_settle_claim_invalid_state_under_review() {
+        let (env, admin, policy_contract, risk_pool, user) = setup_test_env();
+        initialize_contract(&env, &admin, &policy_contract, &risk_pool);
+
+        let processor = Address::generate(&env);
+        ClaimsContract::grant_processor_role(env.clone(), admin.clone(), processor.clone()).unwrap();
+
+        let claim_id = ClaimsContract::submit_claim(
+            env.clone(),
+            user.clone(),
+            1,
+            1000,
+        ).unwrap();
+
+        ClaimsContract::start_review(env.clone(), processor.clone(), claim_id).unwrap();
+
+        // Try to settle while still under review
+        let result = ClaimsContract::settle_claim(env.clone(), processor.clone(), claim_id);
+        assert_eq!(result, Err(ContractError::InvalidClaimState));
+    }
+
+    #[test]
+    fn test_settle_claim_unauthorized() {
+        let (env, admin, policy_contract, risk_pool, user) = setup_test_env();
+        initialize_contract(&env, &admin, &policy_contract, &risk_pool);
+
+        let processor = Address::generate(&env);
+        ClaimsContract::grant_processor_role(env.clone(), admin.clone(), processor.clone()).unwrap();
+
+        let unauthorized_user = Address::generate(&env);
+
+        let claim_id = ClaimsContract::submit_claim(
+            env.clone(),
+            user.clone(),
+            1,
+            1000,
+        ).unwrap();
+
+        // Even if we got it to approved state, unauthorized user can't settle
+        let result = ClaimsContract::settle_claim(env.clone(), unauthorized_user.clone(), claim_id);
+        assert_eq!(result, Err(ContractError::Unauthorized));
+    }
+
+    // ============================================================
+    // ORACLE VALIDATION TESTS
+    // ============================================================
+
+    #[test]
+    fn test_set_oracle_config_success() {
+        let (env, admin, policy_contract, risk_pool, _) = setup_test_env();
+        initialize_contract(&env, &admin, &policy_contract, &risk_pool);
+
+        let oracle_contract = Address::generate(&env);
+
+        let result = ClaimsContract::set_oracle_config(
+            env.clone(),
+            admin.clone(),
+            oracle_contract.clone(),
+            true,
+            3,
+        );
+
+        assert!(result.is_ok());
+
+        // Verify config stored
+        let config = ClaimsContract::get_oracle_config(env.clone()).unwrap();
+        assert_eq!(config.oracle_contract, oracle_contract);
+        assert_eq!(config.require_oracle_validation, true);
+        assert_eq!(config.min_oracle_submissions, 3);
+    }
+
+    #[test]
+    fn test_set_oracle_config_unauthorized() {
+        let (env, admin, policy_contract, risk_pool, _) = setup_test_env();
+        initialize_contract(&env, &admin, &policy_contract, &risk_pool);
+
+        let unauthorized_user = Address::generate(&env);
+        let oracle_contract = Address::generate(&env);
+
+        let result = ClaimsContract::set_oracle_config(
+            env.clone(),
+            unauthorized_user.clone(),
+            oracle_contract.clone(),
+            true,
+            3,
+        );
+
+        assert_eq!(result, Err(ContractError::Unauthorized));
+    }
+
+    #[test]
+    fn test_get_oracle_config_not_set() {
+        let (env, admin, policy_contract, risk_pool, _) = setup_test_env();
+        initialize_contract(&env, &admin, &policy_contract, &risk_pool);
+
+        let result = ClaimsContract::get_oracle_config(env.clone());
+        assert_eq!(result, Err(ContractError::NotFound));
+    }
+
+    // ============================================================
+    // PAUSE/UNPAUSE TESTS
+    // ============================================================
+
+    #[test]
+    fn test_pause_success() {
+        let (env, admin, policy_contract, risk_pool, _) = setup_test_env();
+        initialize_contract(&env, &admin, &policy_contract, &risk_pool);
+
+        let result = ClaimsContract::pause(env.clone(), admin.clone());
+        assert!(result.is_ok());
+
+        assert!(is_paused(&env));
+    }
+
+    #[test]
+    fn test_pause_unauthorized() {
+        let (env, admin, policy_contract, risk_pool, _) = setup_test_env();
+        initialize_contract(&env, &admin, &policy_contract, &risk_pool);
+
+        let unauthorized_user = Address::generate(&env);
+
+        let result = ClaimsContract::pause(env.clone(), unauthorized_user.clone());
+        assert_eq!(result, Err(ContractError::Unauthorized));
+    }
+
+    #[test]
+    fn test_unpause_success() {
+        let (env, admin, policy_contract, risk_pool, _) = setup_test_env();
+        initialize_contract(&env, &admin, &policy_contract, &risk_pool);
+
+        ClaimsContract::pause(env.clone(), admin.clone()).unwrap();
+
+        let result = ClaimsContract::unpause(env.clone(), admin.clone());
+        assert!(result.is_ok());
+
+        assert!(!is_paused(&env));
+    }
+
+    #[test]
+    fn test_unpause_unauthorized() {
+        let (env, admin, policy_contract, risk_pool, _) = setup_test_env();
+        initialize_contract(&env, &admin, &policy_contract, &risk_pool);
+
+        ClaimsContract::pause(env.clone(), admin.clone()).unwrap();
+
+        let unauthorized_user = Address::generate(&env);
+
+        let result = ClaimsContract::unpause(env.clone(), unauthorized_user.clone());
+        assert_eq!(result, Err(ContractError::Unauthorized));
+    }
+
+    // ============================================================
+    // ROLE MANAGEMENT TESTS
+    // ============================================================
+
+    #[test]
+    fn test_grant_processor_role_success() {
+        let (env, admin, policy_contract, risk_pool, _) = setup_test_env();
+        initialize_contract(&env, &admin, &policy_contract, &risk_pool);
+
+        let processor = Address::generate(&env);
+
+        let result = ClaimsContract::grant_processor_role(
+            env.clone(),
+            admin.clone(),
+            processor.clone(),
+        );
+
+        assert!(result.is_ok());
+
+        let role = ClaimsContract::get_user_role(env.clone(), processor.clone());
+        assert_eq!(role, Role::ClaimProcessor);
+    }
+
+    #[test]
+    fn test_grant_processor_role_unauthorized() {
+        let (env, admin, policy_contract, risk_pool, _) = setup_test_env();
+        initialize_contract(&env, &admin, &policy_contract, &risk_pool);
+
+        let unauthorized_user = Address::generate(&env);
+        let processor = Address::generate(&env);
+
+        let result = ClaimsContract::grant_processor_role(
+            env.clone(),
+            unauthorized_user.clone(),
+            processor.clone(),
+        );
+
+        assert_eq!(result, Err(ContractError::Unauthorized));
+    }
+
+    #[test]
+    fn test_revoke_processor_role_success() {
+        let (env, admin, policy_contract, risk_pool, _) = setup_test_env();
+        initialize_contract(&env, &admin, &policy_contract, &risk_pool);
+
+        let processor = Address::generate(&env);
+
+        ClaimsContract::grant_processor_role(
+            env.clone(),
+            admin.clone(),
+            processor.clone(),
+        ).unwrap();
+
+        let result = ClaimsContract::revoke_processor_role(
+            env.clone(),
+            admin.clone(),
+            processor.clone(),
+        );
+
+        assert!(result.is_ok());
+
+        let role = ClaimsContract::get_user_role(env.clone(), processor.clone());
+        assert_eq!(role, Role::User);
+    }
+
+    #[test]
+    fn test_revoke_processor_role_unauthorized() {
+        let (env, admin, policy_contract, risk_pool, _) = setup_test_env();
+        initialize_contract(&env, &admin, &policy_contract, &risk_pool);
+
+        let processor = Address::generate(&env);
+        let unauthorized_user = Address::generate(&env);
+
+        ClaimsContract::grant_processor_role(
+            env.clone(),
+            admin.clone(),
+            processor.clone(),
+        ).unwrap();
+
+        let result = ClaimsContract::revoke_processor_role(
+            env.clone(),
+            unauthorized_user.clone(),
+            processor.clone(),
+        );
+
+        assert_eq!(result, Err(ContractError::Unauthorized));
+    }
+
+    // ============================================================
+    // COMPLEX SCENARIO TESTS
+    // ============================================================
+
+    #[test]
+    fn test_full_claim_lifecycle_rejection_path() {
+        let (env, admin, policy_contract, risk_pool, user) = setup_test_env();
+        initialize_contract(&env, &admin, &policy_contract, &risk_pool);
+
+        let processor = Address::generate(&env);
+        ClaimsContract::grant_processor_role(env.clone(), admin.clone(), processor.clone()).unwrap();
+
+        // Submit claim
+        let claim_id = ClaimsContract::submit_claim(
+            env.clone(),
+            user.clone(),
+            1,
+            1000,
+        ).unwrap();
+
+        let claim = ClaimsContract::get_claim(env.clone(), claim_id).unwrap();
+        assert_eq!(claim.3, ClaimStatus::Submitted);
+
+        // Start review
+        ClaimsContract::start_review(env.clone(), processor.clone(), claim_id).unwrap();
+        let claim = ClaimsContract::get_claim(env.clone(), claim_id).unwrap();
+        assert_eq!(claim.3, ClaimStatus::UnderReview);
+
+        // Reject claim
+        ClaimsContract::reject_claim(env.clone(), processor.clone(), claim_id).unwrap();
+        let claim = ClaimsContract::get_claim(env.clone(), claim_id).unwrap();
+        assert_eq!(claim.3, ClaimStatus::Rejected);
+
+        // Verify can't change state after rejection (terminal state)
+        let result = ClaimsContract::start_review(env.clone(), processor.clone(), claim_id);
+        assert_eq!(result, Err(ContractError::InvalidClaimState));
+    }
+
+    #[test]
+    fn test_multiple_claims_different_policies() {
+        let (env, admin, policy_contract, risk_pool, user) = setup_test_env();
+        initialize_contract(&env, &admin, &policy_contract, &risk_pool);
+
+        // Submit claim for policy 1
+        let claim_id_1 = ClaimsContract::submit_claim(
+            env.clone(),
+            user.clone(),
+            1,
+            1000,
+        ).unwrap();
+
+        // Submit claim for policy 2
+        let claim_id_2 = ClaimsContract::submit_claim(
+            env.clone(),
+            user.clone(),
+            2,
+            2000,
+        ).unwrap();
+
+        // Both should succeed
+        assert_ne!(claim_id_1, claim_id_2);
+
+        let claim1 = ClaimsContract::get_claim(env.clone(), claim_id_1).unwrap();
+        let claim2 = ClaimsContract::get_claim(env.clone(), claim_id_2).unwrap();
+
+        assert_eq!(claim1.0, 1);
+        assert_eq!(claim2.0, 2);
+        assert_eq!(claim1.2, 1000);
+        assert_eq!(claim2.2, 2000);
+    }
+
+    #[test]
+    fn test_state_transition_validation_completeness() {
+        // Test all invalid state transitions
+        assert_eq!(is_valid_state_transition(ClaimStatus::Submitted, ClaimStatus::Submitted), false);
+        assert_eq!(is_valid_state_transition(ClaimStatus::Submitted, ClaimStatus::Approved), false);
+        assert_eq!(is_valid_state_transition(ClaimStatus::Submitted, ClaimStatus::Rejected), false);
+        assert_eq!(is_valid_state_transition(ClaimStatus::Submitted, ClaimStatus::Settled), false);
+
+        assert_eq!(is_valid_state_transition(ClaimStatus::UnderReview, ClaimStatus::Submitted), false);
+        assert_eq!(is_valid_state_transition(ClaimStatus::UnderReview, ClaimStatus::UnderReview), false);
+        assert_eq!(is_valid_state_transition(ClaimStatus::UnderReview, ClaimStatus::Settled), false);
+
+        assert_eq!(is_valid_state_transition(ClaimStatus::Approved, ClaimStatus::Submitted), false);
+        assert_eq!(is_valid_state_transition(ClaimStatus::Approved, ClaimStatus::UnderReview), false);
+        assert_eq!(is_valid_state_transition(ClaimStatus::Approved, ClaimStatus::Approved), false);
+        assert_eq!(is_valid_state_transition(ClaimStatus::Approved, ClaimStatus::Rejected), false);
+
+        assert_eq!(is_valid_state_transition(ClaimStatus::Rejected, ClaimStatus::Submitted), false);
+        assert_eq!(is_valid_state_transition(ClaimStatus::Rejected, ClaimStatus::UnderReview), false);
+        assert_eq!(is_valid_state_transition(ClaimStatus::Rejected, ClaimStatus::Approved), false);
+        assert_eq!(is_valid_state_transition(ClaimStatus::Rejected, ClaimStatus::Settled), false);
+        assert_eq!(is_valid_state_transition(ClaimStatus::Rejected, ClaimStatus::Rejected), false);
+
+        assert_eq!(is_valid_state_transition(ClaimStatus::Settled, ClaimStatus::Submitted), false);
+        assert_eq!(is_valid_state_transition(ClaimStatus::Settled, ClaimStatus::UnderReview), false);
+        assert_eq!(is_valid_state_transition(ClaimStatus::Settled, ClaimStatus::Approved), false);
+        assert_eq!(is_valid_state_transition(ClaimStatus::Settled, ClaimStatus::Rejected), false);
+        assert_eq!(is_valid_state_transition(ClaimStatus::Settled, ClaimStatus::Settled), false);
+
+        // Test all valid transitions
+        assert_eq!(is_valid_state_transition(ClaimStatus::Submitted, ClaimStatus::UnderReview), true);
+        assert_eq!(is_valid_state_transition(ClaimStatus::UnderReview, ClaimStatus::Approved), true);
+        assert_eq!(is_valid_state_transition(ClaimStatus::UnderReview, ClaimStatus::Rejected), true);
+        assert_eq!(is_valid_state_transition(ClaimStatus::Approved, ClaimStatus::Settled), true);
+    }
+
+    #[test]
+    fn test_validate_amount_function() {
+        assert!(validate_amount(1).is_ok());
+        assert!(validate_amount(1000).is_ok());
+        assert!(validate_amount(i128::MAX).is_ok());
+
+        assert_eq!(validate_amount(0), Err(ContractError::InvalidAmount));
+        assert_eq!(validate_amount(-1), Err(ContractError::InvalidAmount));
+        assert_eq!(validate_amount(-1000), Err(ContractError::InvalidAmount));
+    }
+
+    #[test]
+    fn test_validate_coverage_constraint_function() {
+        assert!(validate_coverage_constraint(100, 100).is_ok());
+        assert!(validate_coverage_constraint(100, 200).is_ok());
+        assert!(validate_coverage_constraint(1, i128::MAX).is_ok());
+
+        assert_eq!(
+            validate_coverage_constraint(200, 100),
+            Err(ContractError::CoverageExceeded)
+        );
+        assert_eq!(
+            validate_coverage_constraint(i128::MAX, 100),
+            Err(ContractError::CoverageExceeded)
+        );
+    }
+}

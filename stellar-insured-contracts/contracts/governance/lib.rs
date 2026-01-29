@@ -633,3 +633,1110 @@ impl GovernanceContract {
         get_role(&env, &address)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::testutils::{Address as _, Ledger, LedgerInfo};
+    use soroban_sdk::{Env, Address};
+
+    fn setup_test_env() -> (Env, Address, Address, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let token_contract = Address::generate(&env);
+        let slashing_contract = Address::generate(&env);
+
+        (env, admin, token_contract, slashing_contract)
+    }
+
+    fn initialize_governance(
+        env: &Env,
+        admin: &Address,
+        token: &Address,
+        slashing: &Address,
+    ) {
+        GovernanceContract::initialize(
+            env.clone(),
+            admin.clone(),
+            token.clone(),
+            7,    // voting_period_days
+            51,   // min_voting_percentage
+            20,   // min_quorum_percentage
+            slashing.clone(),
+        ).unwrap();
+    }
+
+    // ============================================================
+    // INITIALIZATION TESTS
+    // ============================================================
+
+    #[test]
+    fn test_initialize_success() {
+        let (env, admin, token, slashing) = setup_test_env();
+
+        let result = GovernanceContract::initialize(
+            env.clone(),
+            admin.clone(),
+            token.clone(),
+            7,
+            51,
+            20,
+            slashing.clone(),
+        );
+
+        assert!(result.is_ok());
+
+        let config = GovernanceContract::get_config(env.clone()).unwrap();
+        assert_eq!(config.0, token);
+        assert_eq!(config.1, 7);
+        assert_eq!(config.2, 51);
+        assert_eq!(config.3, 20);
+    }
+
+    #[test]
+    fn test_initialize_already_initialized() {
+        let (env, admin, token, slashing) = setup_test_env();
+        initialize_governance(&env, &admin, &token, &slashing);
+
+        let result = GovernanceContract::initialize(
+            env.clone(),
+            admin.clone(),
+            token.clone(),
+            7,
+            51,
+            20,
+            slashing.clone(),
+        );
+
+        assert_eq!(result, Err(ContractError::AlreadyInitialized));
+    }
+
+    #[test]
+    fn test_initialize_invalid_voting_period_zero() {
+        let (env, admin, token, slashing) = setup_test_env();
+
+        let result = GovernanceContract::initialize(
+            env.clone(),
+            admin.clone(),
+            token.clone(),
+            0,  // invalid
+            51,
+            20,
+            slashing.clone(),
+        );
+
+        assert_eq!(result, Err(ContractError::InvalidInput));
+    }
+
+    #[test]
+    fn test_initialize_invalid_voting_period_too_large() {
+        let (env, admin, token, slashing) = setup_test_env();
+
+        let result = GovernanceContract::initialize(
+            env.clone(),
+            admin.clone(),
+            token.clone(),
+            366,  // > 365
+            51,
+            20,
+            slashing.clone(),
+        );
+
+        assert_eq!(result, Err(ContractError::InvalidInput));
+    }
+
+    #[test]
+    fn test_initialize_invalid_min_voting_percentage_zero() {
+        let (env, admin, token, slashing) = setup_test_env();
+
+        let result = GovernanceContract::initialize(
+            env.clone(),
+            admin.clone(),
+            token.clone(),
+            7,
+            0,  // invalid
+            20,
+            slashing.clone(),
+        );
+
+        assert_eq!(result, Err(ContractError::InvalidInput));
+    }
+
+    #[test]
+    fn test_initialize_invalid_min_voting_percentage_too_large() {
+        let (env, admin, token, slashing) = setup_test_env();
+
+        let result = GovernanceContract::initialize(
+            env.clone(),
+            admin.clone(),
+            token.clone(),
+            7,
+            101,  // > 100
+            20,
+            slashing.clone(),
+        );
+
+        assert_eq!(result, Err(ContractError::InvalidInput));
+    }
+
+    #[test]
+    fn test_initialize_invalid_quorum_percentage_zero() {
+        let (env, admin, token, slashing) = setup_test_env();
+
+        let result = GovernanceContract::initialize(
+            env.clone(),
+            admin.clone(),
+            token.clone(),
+            7,
+            51,
+            0,  // invalid
+            slashing.clone(),
+        );
+
+        assert_eq!(result, Err(ContractError::InvalidInput));
+    }
+
+    #[test]
+    fn test_initialize_invalid_quorum_percentage_too_large() {
+        let (env, admin, token, slashing) = setup_test_env();
+
+        let result = GovernanceContract::initialize(
+            env.clone(),
+            admin.clone(),
+            token.clone(),
+            7,
+            51,
+            101,  // > 100
+            slashing.clone(),
+        );
+
+        assert_eq!(result, Err(ContractError::InvalidInput));
+    }
+
+    // ============================================================
+    // CREATE PROPOSAL TESTS
+    // ============================================================
+
+    #[test]
+    fn test_create_proposal_success() {
+        let (env, admin, token, slashing) = setup_test_env();
+        initialize_governance(&env, &admin, &token, &slashing);
+
+        let proposer = Address::generate(&env);
+
+        let result = GovernanceContract::create_proposal(
+            env.clone(),
+            proposer.clone(),
+            Symbol::new(&env, "title"),
+            Symbol::new(&env, "desc"),
+            Symbol::new(&env, "exec_data"),
+            51,
+        );
+
+        assert!(result.is_ok());
+        let proposal_id = result.unwrap();
+        assert_eq!(proposal_id, 1);
+
+        let proposal = GovernanceContract::get_proposal(env.clone(), proposal_id).unwrap();
+        assert_eq!(proposal.0, proposal_id);
+        assert_eq!(proposal.1, proposer);
+        assert_eq!(proposal.6, 51);
+        assert_eq!(proposal.7, ProposalStatus::Active as u32);
+    }
+
+    #[test]
+    fn test_create_proposal_when_paused() {
+        let (env, admin, token, slashing) = setup_test_env();
+        initialize_governance(&env, &admin, &token, &slashing);
+
+        GovernanceContract::pause(env.clone(), admin.clone()).unwrap();
+
+        let proposer = Address::generate(&env);
+
+        let result = GovernanceContract::create_proposal(
+            env.clone(),
+            proposer.clone(),
+            Symbol::new(&env, "title"),
+            Symbol::new(&env, "desc"),
+            Symbol::new(&env, "exec_data"),
+            51,
+        );
+
+        assert_eq!(result, Err(ContractError::Paused));
+    }
+
+    #[test]
+    fn test_create_proposal_invalid_threshold_zero() {
+        let (env, admin, token, slashing) = setup_test_env();
+        initialize_governance(&env, &admin, &token, &slashing);
+
+        let proposer = Address::generate(&env);
+
+        let result = GovernanceContract::create_proposal(
+            env.clone(),
+            proposer.clone(),
+            Symbol::new(&env, "title"),
+            Symbol::new(&env, "desc"),
+            Symbol::new(&env, "exec_data"),
+            0,  // invalid
+        );
+
+        assert_eq!(result, Err(ContractError::InvalidInput));
+    }
+
+    #[test]
+    fn test_create_proposal_invalid_threshold_too_large() {
+        let (env, admin, token, slashing) = setup_test_env();
+        initialize_governance(&env, &admin, &token, &slashing);
+
+        let proposer = Address::generate(&env);
+
+        let result = GovernanceContract::create_proposal(
+            env.clone(),
+            proposer.clone(),
+            Symbol::new(&env, "title"),
+            Symbol::new(&env, "desc"),
+            Symbol::new(&env, "exec_data"),
+            101,  // > 100
+        );
+
+        assert_eq!(result, Err(ContractError::InvalidInput));
+    }
+
+    #[test]
+    fn test_create_multiple_proposals() {
+        let (env, admin, token, slashing) = setup_test_env();
+        initialize_governance(&env, &admin, &token, &slashing);
+
+        let proposer = Address::generate(&env);
+
+        let id1 = GovernanceContract::create_proposal(
+            env.clone(),
+            proposer.clone(),
+            Symbol::new(&env, "title1"),
+            Symbol::new(&env, "desc1"),
+            Symbol::new(&env, "exec_data1"),
+            51,
+        ).unwrap();
+
+        let id2 = GovernanceContract::create_proposal(
+            env.clone(),
+            proposer.clone(),
+            Symbol::new(&env, "title2"),
+            Symbol::new(&env, "desc2"),
+            Symbol::new(&env, "exec_data2"),
+            60,
+        ).unwrap();
+
+        assert_eq!(id1, 1);
+        assert_eq!(id2, 2);
+
+        let count = GovernanceContract::get_proposal_count(env.clone()).unwrap();
+        assert_eq!(count, 2);
+    }
+
+    // ============================================================
+    // VOTING TESTS
+    // ============================================================
+
+    #[test]
+    fn test_vote_success() {
+        let (env, admin, token, slashing) = setup_test_env();
+        initialize_governance(&env, &admin, &token, &slashing);
+
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+
+        let proposal_id = GovernanceContract::create_proposal(
+            env.clone(),
+            proposer.clone(),
+            Symbol::new(&env, "title"),
+            Symbol::new(&env, "desc"),
+            Symbol::new(&env, "exec_data"),
+            51,
+        ).unwrap();
+
+        let result = GovernanceContract::vote(
+            env.clone(),
+            voter.clone(),
+            proposal_id,
+            1000,
+            true,
+        );
+
+        assert!(result.is_ok());
+
+        let proposal = GovernanceContract::get_proposal(env.clone(), proposal_id).unwrap();
+        assert_eq!(proposal.8, 1000);  // yes votes
+        assert_eq!(proposal.9, 0);     // no votes
+        assert_eq!(proposal.10, 1);    // voter count
+    }
+
+    #[test]
+    fn test_vote_no_vote() {
+        let (env, admin, token, slashing) = setup_test_env();
+        initialize_governance(&env, &admin, &token, &slashing);
+
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+
+        let proposal_id = GovernanceContract::create_proposal(
+            env.clone(),
+            proposer.clone(),
+            Symbol::new(&env, "title"),
+            Symbol::new(&env, "desc"),
+            Symbol::new(&env, "exec_data"),
+            51,
+        ).unwrap();
+
+        GovernanceContract::vote(
+            env.clone(),
+            voter.clone(),
+            proposal_id,
+            1000,
+            false,  // no vote
+        ).unwrap();
+
+        let proposal = GovernanceContract::get_proposal(env.clone(), proposal_id).unwrap();
+        assert_eq!(proposal.8, 0);     // yes votes
+        assert_eq!(proposal.9, 1000);  // no votes
+        assert_eq!(proposal.10, 1);    // voter count
+    }
+
+    #[test]
+    fn test_vote_multiple_voters() {
+        let (env, admin, token, slashing) = setup_test_env();
+        initialize_governance(&env, &admin, &token, &slashing);
+
+        let proposer = Address::generate(&env);
+        let voter1 = Address::generate(&env);
+        let voter2 = Address::generate(&env);
+        let voter3 = Address::generate(&env);
+
+        let proposal_id = GovernanceContract::create_proposal(
+            env.clone(),
+            proposer.clone(),
+            Symbol::new(&env, "title"),
+            Symbol::new(&env, "desc"),
+            Symbol::new(&env, "exec_data"),
+            51,
+        ).unwrap();
+
+        GovernanceContract::vote(env.clone(), voter1.clone(), proposal_id, 1000, true).unwrap();
+        GovernanceContract::vote(env.clone(), voter2.clone(), proposal_id, 500, true).unwrap();
+        GovernanceContract::vote(env.clone(), voter3.clone(), proposal_id, 300, false).unwrap();
+
+        let proposal = GovernanceContract::get_proposal(env.clone(), proposal_id).unwrap();
+        assert_eq!(proposal.8, 1500);  // yes votes
+        assert_eq!(proposal.9, 300);   // no votes
+        assert_eq!(proposal.10, 3);    // voter count
+    }
+
+    #[test]
+    fn test_vote_already_voted() {
+        let (env, admin, token, slashing) = setup_test_env();
+        initialize_governance(&env, &admin, &token, &slashing);
+
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+
+        let proposal_id = GovernanceContract::create_proposal(
+            env.clone(),
+            proposer.clone(),
+            Symbol::new(&env, "title"),
+            Symbol::new(&env, "desc"),
+            Symbol::new(&env, "exec_data"),
+            51,
+        ).unwrap();
+
+        GovernanceContract::vote(
+            env.clone(),
+            voter.clone(),
+            proposal_id,
+            1000,
+            true,
+        ).unwrap();
+
+        let result = GovernanceContract::vote(
+            env.clone(),
+            voter.clone(),
+            proposal_id,
+            500,
+            false,
+        );
+
+        assert_eq!(result, Err(ContractError::AlreadyVoted));
+    }
+
+    #[test]
+    fn test_vote_invalid_weight_zero() {
+        let (env, admin, token, slashing) = setup_test_env();
+        initialize_governance(&env, &admin, &token, &slashing);
+
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+
+        let proposal_id = GovernanceContract::create_proposal(
+            env.clone(),
+            proposer.clone(),
+            Symbol::new(&env, "title"),
+            Symbol::new(&env, "desc"),
+            Symbol::new(&env, "exec_data"),
+            51,
+        ).unwrap();
+
+        let result = GovernanceContract::vote(
+            env.clone(),
+            voter.clone(),
+            proposal_id,
+            0,  // invalid
+            true,
+        );
+
+        assert_eq!(result, Err(ContractError::InvalidInput));
+    }
+
+    #[test]
+    fn test_vote_invalid_weight_negative() {
+        let (env, admin, token, slashing) = setup_test_env();
+        initialize_governance(&env, &admin, &token, &slashing);
+
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+
+        let proposal_id = GovernanceContract::create_proposal(
+            env.clone(),
+            proposer.clone(),
+            Symbol::new(&env, "title"),
+            Symbol::new(&env, "desc"),
+            Symbol::new(&env, "exec_data"),
+            51,
+        ).unwrap();
+
+        let result = GovernanceContract::vote(
+            env.clone(),
+            voter.clone(),
+            proposal_id,
+            -100,  // invalid
+            true,
+        );
+
+        assert_eq!(result, Err(ContractError::InvalidInput));
+    }
+
+    #[test]
+    fn test_vote_when_paused() {
+        let (env, admin, token, slashing) = setup_test_env();
+        initialize_governance(&env, &admin, &token, &slashing);
+
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+
+        let proposal_id = GovernanceContract::create_proposal(
+            env.clone(),
+            proposer.clone(),
+            Symbol::new(&env, "title"),
+            Symbol::new(&env, "desc"),
+            Symbol::new(&env, "exec_data"),
+            51,
+        ).unwrap();
+
+        GovernanceContract::pause(env.clone(), admin.clone()).unwrap();
+
+        let result = GovernanceContract::vote(
+            env.clone(),
+            voter.clone(),
+            proposal_id,
+            1000,
+            true,
+        );
+
+        assert_eq!(result, Err(ContractError::Paused));
+    }
+
+    #[test]
+    fn test_vote_nonexistent_proposal() {
+        let (env, admin, token, slashing) = setup_test_env();
+        initialize_governance(&env, &admin, &token, &slashing);
+
+        let voter = Address::generate(&env);
+
+        let result = GovernanceContract::vote(
+            env.clone(),
+            voter.clone(),
+            99999,  // nonexistent
+            1000,
+            true,
+        );
+
+        assert_eq!(result, Err(ContractError::NotFound));
+    }
+
+    #[test]
+    fn test_vote_after_voting_period_ended() {
+        let (env, admin, token, slashing) = setup_test_env();
+        initialize_governance(&env, &admin, &token, &slashing);
+
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+
+        let proposal_id = GovernanceContract::create_proposal(
+            env.clone(),
+            proposer.clone(),
+            Symbol::new(&env, "title"),
+            Symbol::new(&env, "desc"),
+            Symbol::new(&env, "exec_data"),
+            51,
+        ).unwrap();
+
+        // Advance time beyond voting period (7 days = 604800 seconds)
+        env.ledger().set(LedgerInfo {
+            timestamp: env.ledger().timestamp() + 604801,
+            protocol_version: 20,
+            sequence_number: env.ledger().sequence(),
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 1,
+            min_persistent_entry_ttl: 1,
+            max_entry_ttl: 100000,
+        });
+
+        let result = GovernanceContract::vote(
+            env.clone(),
+            voter.clone(),
+            proposal_id,
+            1000,
+            true,
+        );
+
+        assert_eq!(result, Err(ContractError::VotingPeriodEnded));
+    }
+
+    // ============================================================
+    // FINALIZE PROPOSAL TESTS
+    // ============================================================
+
+    #[test]
+    fn test_finalize_proposal_passed() {
+        let (env, admin, token, slashing) = setup_test_env();
+        initialize_governance(&env, &admin, &token, &slashing);
+
+        let proposer = Address::generate(&env);
+        let voter1 = Address::generate(&env);
+        let voter2 = Address::generate(&env);
+
+        let proposal_id = GovernanceContract::create_proposal(
+            env.clone(),
+            proposer.clone(),
+            Symbol::new(&env, "title"),
+            Symbol::new(&env, "desc"),
+            Symbol::new(&env, "exec_data"),
+            51,
+        ).unwrap();
+
+        // Cast votes to meet quorum and threshold
+        // total_supply is hardcoded to 1,000,000 in the contract
+        // min_quorum is 20%, so need >= 200,000 votes
+        // threshold is 51%, so need >= 51% yes votes
+        GovernanceContract::vote(env.clone(), voter1.clone(), proposal_id, 150000, true).unwrap();
+        GovernanceContract::vote(env.clone(), voter2.clone(), proposal_id, 60000, true).unwrap();
+
+        // Advance time beyond voting period
+        env.ledger().set(LedgerInfo {
+            timestamp: env.ledger().timestamp() + 604801,
+            protocol_version: 20,
+            sequence_number: env.ledger().sequence(),
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 1,
+            min_persistent_entry_ttl: 1,
+            max_entry_ttl: 100000,
+        });
+
+        let result = GovernanceContract::finalize_proposal(env.clone(), proposal_id);
+        assert!(result.is_ok());
+
+        let proposal = GovernanceContract::get_proposal(env.clone(), proposal_id).unwrap();
+        assert_eq!(proposal.7, ProposalStatus::Passed as u32);
+    }
+
+    #[test]
+    fn test_finalize_proposal_rejected_by_threshold() {
+        let (env, admin, token, slashing) = setup_test_env();
+        initialize_governance(&env, &admin, &token, &slashing);
+
+        let proposer = Address::generate(&env);
+        let voter1 = Address::generate(&env);
+        let voter2 = Address::generate(&env);
+
+        let proposal_id = GovernanceContract::create_proposal(
+            env.clone(),
+            proposer.clone(),
+            Symbol::new(&env, "title"),
+            Symbol::new(&env, "desc"),
+            Symbol::new(&env, "exec_data"),
+            51,
+        ).unwrap();
+
+        // Cast votes to meet quorum but fail threshold
+        // 100,000 yes, 110,000 no = 210,000 total (21% quorum, passes)
+        // 47.6% yes (fails 51% threshold)
+        GovernanceContract::vote(env.clone(), voter1.clone(), proposal_id, 100000, true).unwrap();
+        GovernanceContract::vote(env.clone(), voter2.clone(), proposal_id, 110000, false).unwrap();
+
+        // Advance time
+        env.ledger().set(LedgerInfo {
+            timestamp: env.ledger().timestamp() + 604801,
+            protocol_version: 20,
+            sequence_number: env.ledger().sequence(),
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 1,
+            min_persistent_entry_ttl: 1,
+            max_entry_ttl: 100000,
+        });
+
+        GovernanceContract::finalize_proposal(env.clone(), proposal_id).unwrap();
+
+        let proposal = GovernanceContract::get_proposal(env.clone(), proposal_id).unwrap();
+        assert_eq!(proposal.7, ProposalStatus::Rejected as u32);
+    }
+
+    #[test]
+    fn test_finalize_proposal_expired_by_quorum() {
+        let (env, admin, token, slashing) = setup_test_env();
+        initialize_governance(&env, &admin, &token, &slashing);
+
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+
+        let proposal_id = GovernanceContract::create_proposal(
+            env.clone(),
+            proposer.clone(),
+            Symbol::new(&env, "title"),
+            Symbol::new(&env, "desc"),
+            Symbol::new(&env, "exec_data"),
+            51,
+        ).unwrap();
+
+        // Cast insufficient votes to meet quorum
+        // Need 20% of 1,000,000 = 200,000
+        // Only cast 100,000
+        GovernanceContract::vote(env.clone(), voter.clone(), proposal_id, 100000, true).unwrap();
+
+        // Advance time
+        env.ledger().set(LedgerInfo {
+            timestamp: env.ledger().timestamp() + 604801,
+            protocol_version: 20,
+            sequence_number: env.ledger().sequence(),
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 1,
+            min_persistent_entry_ttl: 1,
+            max_entry_ttl: 100000,
+        });
+
+        GovernanceContract::finalize_proposal(env.clone(), proposal_id).unwrap();
+
+        let proposal = GovernanceContract::get_proposal(env.clone(), proposal_id).unwrap();
+        assert_eq!(proposal.7, ProposalStatus::Expired as u32);
+    }
+
+    #[test]
+    fn test_finalize_proposal_before_voting_ends() {
+        let (env, admin, token, slashing) = setup_test_env();
+        initialize_governance(&env, &admin, &token, &slashing);
+
+        let proposer = Address::generate(&env);
+
+        let proposal_id = GovernanceContract::create_proposal(
+            env.clone(),
+            proposer.clone(),
+            Symbol::new(&env, "title"),
+            Symbol::new(&env, "desc"),
+            Symbol::new(&env, "exec_data"),
+            51,
+        ).unwrap();
+
+        let result = GovernanceContract::finalize_proposal(env.clone(), proposal_id);
+        assert_eq!(result, Err(ContractError::InvalidState));
+    }
+
+    #[test]
+    fn test_finalize_proposal_already_finalized() {
+        let (env, admin, token, slashing) = setup_test_env();
+        initialize_governance(&env, &admin, &token, &slashing);
+
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+
+        let proposal_id = GovernanceContract::create_proposal(
+            env.clone(),
+            proposer.clone(),
+            Symbol::new(&env, "title"),
+            Symbol::new(&env, "desc"),
+            Symbol::new(&env, "exec_data"),
+            51,
+        ).unwrap();
+
+        GovernanceContract::vote(env.clone(), voter.clone(), proposal_id, 250000, true).unwrap();
+
+        // Advance time
+        env.ledger().set(LedgerInfo {
+            timestamp: env.ledger().timestamp() + 604801,
+            protocol_version: 20,
+            sequence_number: env.ledger().sequence(),
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 1,
+            min_persistent_entry_ttl: 1,
+            max_entry_ttl: 100000,
+        });
+
+        GovernanceContract::finalize_proposal(env.clone(), proposal_id).unwrap();
+
+        // Try to finalize again
+        let result = GovernanceContract::finalize_proposal(env.clone(), proposal_id);
+        assert_eq!(result, Err(ContractError::ProposalNotActive));
+    }
+
+    // ============================================================
+    // EXECUTE PROPOSAL TESTS
+    // ============================================================
+
+    #[test]
+    fn test_execute_proposal_success() {
+        let (env, admin, token, slashing) = setup_test_env();
+        initialize_governance(&env, &admin, &token, &slashing);
+
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+
+        let proposal_id = GovernanceContract::create_proposal(
+            env.clone(),
+            proposer.clone(),
+            Symbol::new(&env, "title"),
+            Symbol::new(&env, "desc"),
+            Symbol::new(&env, "exec_data"),
+            51,
+        ).unwrap();
+
+        GovernanceContract::vote(env.clone(), voter.clone(), proposal_id, 250000, true).unwrap();
+
+        env.ledger().set(LedgerInfo {
+            timestamp: env.ledger().timestamp() + 604801,
+            protocol_version: 20,
+            sequence_number: env.ledger().sequence(),
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 1,
+            min_persistent_entry_ttl: 1,
+            max_entry_ttl: 100000,
+        });
+
+        GovernanceContract::finalize_proposal(env.clone(), proposal_id).unwrap();
+
+        let result = GovernanceContract::execute_proposal(env.clone(), proposal_id);
+        assert!(result.is_ok());
+
+        let proposal = GovernanceContract::get_proposal(env.clone(), proposal_id).unwrap();
+        assert_eq!(proposal.7, ProposalStatus::Executed as u32);
+    }
+
+    #[test]
+    fn test_execute_proposal_not_passed() {
+        let (env, admin, token, slashing) = setup_test_env();
+        initialize_governance(&env, &admin, &token, &slashing);
+
+        let proposer = Address::generate(&env);
+
+        let proposal_id = GovernanceContract::create_proposal(
+            env.clone(),
+            proposer.clone(),
+            Symbol::new(&env, "title"),
+            Symbol::new(&env, "desc"),
+            Symbol::new(&env, "exec_data"),
+            51,
+        ).unwrap();
+
+        let result = GovernanceContract::execute_proposal(env.clone(), proposal_id);
+        assert_eq!(result, Err(ContractError::InvalidState));
+    }
+
+    // ============================================================
+    // GOVERNANCE MANIPULATION ATTACK TESTS
+    // ============================================================
+
+    #[test]
+    fn test_governance_manipulation_vote_weight_overflow_attempt() {
+        let (env, admin, token, slashing) = setup_test_env();
+        initialize_governance(&env, &admin, &token, &slashing);
+
+        let proposer = Address::generate(&env);
+        let voter1 = Address::generate(&env);
+        let voter2 = Address::generate(&env);
+
+        let proposal_id = GovernanceContract::create_proposal(
+            env.clone(),
+            proposer.clone(),
+            Symbol::new(&env, "title"),
+            Symbol::new(&env, "desc"),
+            Symbol::new(&env, "exec_data"),
+            51,
+        ).unwrap();
+
+        // Try to overflow vote weight
+        GovernanceContract::vote(env.clone(), voter1.clone(), proposal_id, i128::MAX / 2, true).unwrap();
+
+        // This should work if overflow protection is in place
+        let result = GovernanceContract::vote(env.clone(), voter2.clone(), proposal_id, i128::MAX / 2, true);
+        // In a production system, this should either panic or handle gracefully
+    }
+
+    #[test]
+    fn test_governance_manipulation_double_voting_prevented() {
+        let (env, admin, token, slashing) = setup_test_env();
+        initialize_governance(&env, &admin, &token, &slashing);
+
+        let proposer = Address::generate(&env);
+        let voter = Address::generate(&env);
+
+        let proposal_id = GovernanceContract::create_proposal(
+            env.clone(),
+            proposer.clone(),
+            Symbol::new(&env, "title"),
+            Symbol::new(&env, "desc"),
+            Symbol::new(&env, "exec_data"),
+            51,
+        ).unwrap();
+
+        GovernanceContract::vote(env.clone(), voter.clone(), proposal_id, 1000, true).unwrap();
+
+        // Attempt to vote again with different choice
+        let result = GovernanceContract::vote(env.clone(), voter.clone(), proposal_id, 2000, false);
+        assert_eq!(result, Err(ContractError::AlreadyVoted));
+    }
+
+    #[test]
+    fn test_governance_manipulation_voting_after_finalization() {
+        let (env, admin, token, slashing) = setup_test_env();
+        initialize_governance(&env, &admin, &token, &slashing);
+
+        let proposer = Address::generate(&env);
+        let voter1 = Address::generate(&env);
+        let voter2 = Address::generate(&env);
+
+        let proposal_id = GovernanceContract::create_proposal(
+            env.clone(),
+            proposer.clone(),
+            Symbol::new(&env, "title"),
+            Symbol::new(&env, "desc"),
+            Symbol::new(&env, "exec_data"),
+            51,
+        ).unwrap();
+
+        GovernanceContract::vote(env.clone(), voter1.clone(), proposal_id, 250000, true).unwrap();
+
+        env.ledger().set(LedgerInfo {
+            timestamp: env.ledger().timestamp() + 604801,
+            protocol_version: 20,
+            sequence_number: env.ledger().sequence(),
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 1,
+            min_persistent_entry_ttl: 1,
+            max_entry_ttl: 100000,
+        });
+
+        GovernanceContract::finalize_proposal(env.clone(), proposal_id).unwrap();
+
+        // Try to vote after finalization
+        let result = GovernanceContract::vote(env.clone(), voter2.clone(), proposal_id, 100000, false);
+        assert_eq!(result, Err(ContractError::VotingPeriodEnded));
+    }
+
+    // ============================================================
+    // ROLE MANAGEMENT TESTS
+    // ============================================================
+
+    #[test]
+    fn test_grant_governance_role_success() {
+        let (env, admin, token, slashing) = setup_test_env();
+        initialize_governance(&env, &admin, &token, &slashing);
+
+        let participant = Address::generate(&env);
+
+        let result = GovernanceContract::grant_governance_role(
+            env.clone(),
+            admin.clone(),
+            participant.clone(),
+        );
+
+        assert!(result.is_ok());
+
+        let role = GovernanceContract::get_user_role(env.clone(), participant.clone());
+        assert_eq!(role, Role::Governance);
+    }
+
+    #[test]
+    fn test_grant_governance_role_unauthorized() {
+        let (env, admin, token, slashing) = setup_test_env();
+        initialize_governance(&env, &admin, &token, &slashing);
+
+        let unauthorized = Address::generate(&env);
+        let participant = Address::generate(&env);
+
+        let result = GovernanceContract::grant_governance_role(
+            env.clone(),
+            unauthorized.clone(),
+            participant.clone(),
+        );
+
+        assert_eq!(result, Err(ContractError::Unauthorized));
+    }
+
+    #[test]
+    fn test_revoke_governance_role_success() {
+        let (env, admin, token, slashing) = setup_test_env();
+        initialize_governance(&env, &admin, &token, &slashing);
+
+        let participant = Address::generate(&env);
+
+        GovernanceContract::grant_governance_role(
+            env.clone(),
+            admin.clone(),
+            participant.clone(),
+        ).unwrap();
+
+        let result = GovernanceContract::revoke_governance_role(
+            env.clone(),
+            admin.clone(),
+            participant.clone(),
+        );
+
+        assert!(result.is_ok());
+
+        let role = GovernanceContract::get_user_role(env.clone(), participant.clone());
+        assert_eq!(role, Role::User);
+    }
+
+    // ============================================================
+    // PAUSE/UNPAUSE TESTS
+    // ============================================================
+
+    #[test]
+    fn test_pause_success() {
+        let (env, admin, token, slashing) = setup_test_env();
+        initialize_governance(&env, &admin, &token, &slashing);
+
+        let result = GovernanceContract::pause(env.clone(), admin.clone());
+        assert!(result.is_ok());
+        assert!(GovernanceContract::is_contract_paused(env.clone()));
+    }
+
+    #[test]
+    fn test_pause_unauthorized() {
+        let (env, admin, token, slashing) = setup_test_env();
+        initialize_governance(&env, &admin, &token, &slashing);
+
+        let unauthorized = Address::generate(&env);
+
+        let result = GovernanceContract::pause(env.clone(), unauthorized.clone());
+        assert_eq!(result, Err(ContractError::Unauthorized));
+    }
+
+    #[test]
+    fn test_unpause_success() {
+        let (env, admin, token, slashing) = setup_test_env();
+        initialize_governance(&env, &admin, &token, &slashing);
+
+        GovernanceContract::pause(env.clone(), admin.clone()).unwrap();
+
+        let result = GovernanceContract::unpause(env.clone(), admin.clone());
+        assert!(result.is_ok());
+        assert!(!GovernanceContract::is_contract_paused(env.clone()));
+    }
+
+    // ============================================================
+    // UTILITY FUNCTION TESTS
+    // ============================================================
+
+    #[test]
+    fn test_calculate_quorum_met() {
+        assert_eq!(calculate_quorum_met(100, 0, 1000, 10), true);   // 10% quorum, met
+        assert_eq!(calculate_quorum_met(50, 50, 1000, 10), true);   // 10% quorum, met
+        assert_eq!(calculate_quorum_met(50, 0, 1000, 10), false);   // 5% quorum, not met
+        assert_eq!(calculate_quorum_met(0, 0, 1000, 10), false);    // 0% quorum, not met
+        assert_eq!(calculate_quorum_met(100, 0, 0, 10), false);     // Division by zero protection
+    }
+
+    #[test]
+    fn test_calculate_threshold_met() {
+        assert_eq!(calculate_threshold_met(60, 40, 51), true);      // 60% yes, threshold met
+        assert_eq!(calculate_threshold_met(51, 49, 51), true);      // 51% yes, threshold met
+        assert_eq!(calculate_threshold_met(50, 50, 51), false);     // 50% yes, threshold not met
+        assert_eq!(calculate_threshold_met(40, 60, 51), false);     // 40% yes, threshold not met
+        assert_eq!(calculate_threshold_met(0, 0, 51), false);       // Division by zero protection
+    }
+
+    #[test]
+    fn test_get_active_proposals() {
+        let (env, admin, token, slashing) = setup_test_env();
+        initialize_governance(&env, &admin, &token, &slashing);
+
+        let proposer = Address::generate(&env);
+
+        let id1 = GovernanceContract::create_proposal(
+            env.clone(),
+            proposer.clone(),
+            Symbol::new(&env, "title1"),
+            Symbol::new(&env, "desc1"),
+            Symbol::new(&env, "exec1"),
+            51,
+        ).unwrap();
+
+        let id2 = GovernanceContract::create_proposal(
+            env.clone(),
+            proposer.clone(),
+            Symbol::new(&env, "title2"),
+            Symbol::new(&env, "desc2"),
+            Symbol::new(&env, "exec2"),
+            60,
+        ).unwrap();
+
+        let active = GovernanceContract::get_active_proposals(env.clone()).unwrap();
+        assert_eq!(active.len(), 2);
+        assert!(active.contains(&id1));
+        assert!(active.contains(&id2));
+    }
+
+    #[test]
+    fn test_get_proposal_stats() {
+        let (env, admin, token, slashing) = setup_test_env();
+        initialize_governance(&env, &admin, &token, &slashing);
+
+        let proposer = Address::generate(&env);
+        let voter1 = Address::generate(&env);
+        let voter2 = Address::generate(&env);
+
+        let proposal_id = GovernanceContract::create_proposal(
+            env.clone(),
+            proposer.clone(),
+            Symbol::new(&env, "title"),
+            Symbol::new(&env, "desc"),
+            Symbol::new(&env, "exec"),
+            51,
+        ).unwrap();
+
+        GovernanceContract::vote(env.clone(), voter1.clone(), proposal_id, 600, true).unwrap();
+        GovernanceContract::vote(env.clone(), voter2.clone(), proposal_id, 400, false).unwrap();
+
+        let stats = GovernanceContract::get_proposal_stats(env.clone(), proposal_id).unwrap();
+        assert_eq!(stats.0, 600);   // yes votes
+        assert_eq!(stats.1, 400);   // no votes
+        assert_eq!(stats.2, 2);     // voter count
+        assert_eq!(stats.3, 60);    // yes percentage
+    }
+}
