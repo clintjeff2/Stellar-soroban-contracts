@@ -202,15 +202,18 @@ impl GovernanceContract {
         validate_address(&env, &token_contract)?;
         validate_address(&env, &slashing_contract)?;
 
+        // Voting period: 1–365 days
         if voting_period_days == 0 || voting_period_days > 365 {
             return Err(ContractError::InvalidInput);
         }
 
-        if min_voting_percentage == 0 || min_voting_percentage > 100 {
+        // Approval threshold must be > 50 % (simple majority)
+        if min_voting_percentage <= 50 || min_voting_percentage > 100 {
             return Err(ContractError::InvalidInput);
         }
 
-        if min_quorum_percentage == 0 || min_quorum_percentage > 100 {
+        // Minimum quorum: at least 10 % of voting power must participate
+        if min_quorum_percentage < 10 || min_quorum_percentage > 100 {
             return Err(ContractError::InvalidInput);
         }
 
@@ -268,7 +271,8 @@ impl GovernanceContract {
             return Err(ContractError::Paused);
         }
 
-        if threshold_percentage == 0 || threshold_percentage > 100 {
+        // Threshold must be > 50 % (simple majority rule)
+        if threshold_percentage <= 50 || threshold_percentage > 100 {
             return Err(ContractError::InvalidInput);
         }
 
@@ -353,7 +357,13 @@ impl GovernanceContract {
             },
         )?;
 
+        // Vote weight must be strictly positive
         if vote_weight <= 0 {
+            return Err(ContractError::InvalidInput);
+        }
+        // Guard against absurdly large vote weights that could overflow aggregation
+        const MAX_VOTE_WEIGHT: i128 = 1_000_000_000_000_000_000;
+        if vote_weight > MAX_VOTE_WEIGHT {
             return Err(ContractError::InvalidInput);
         }
 
@@ -608,11 +618,18 @@ impl GovernanceContract {
             return Err(ContractError::Paused);
         }
 
+        // Slashing amount must be strictly positive
         if amount <= 0 {
             return Err(ContractError::InvalidInput);
         }
+        // Sanity cap: max slashing per proposal is 1 billion units
+        const MAX_SLASH_AMOUNT: i128 = 1_000_000_000_000_000;
+        if amount > MAX_SLASH_AMOUNT {
+            return Err(ContractError::InvalidInput);
+        }
 
-        if threshold_percentage == 0 || threshold_percentage > 100 {
+        // Threshold must be a valid percentage > 50 %
+        if threshold_percentage <= 50 || threshold_percentage > 100 {
             return Err(ContractError::InvalidInput);
         }
 
