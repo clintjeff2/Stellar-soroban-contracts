@@ -151,6 +151,11 @@ impl RiskPoolContract {
         if min_provider_stake <= 0 {
             return Err(ContractError::InvalidInput);
         }
+        // Sanity cap: min stake cannot exceed 1 billion XLM expressed in stroops
+        const MAX_MIN_STAKE: i128 = 10_000_000_000_000_000;
+        if min_provider_stake > MAX_MIN_STAKE {
+            return Err(ContractError::InvalidInput);
+        }
 
         // Initialize authorization system with admin
         admin.require_auth();
@@ -192,7 +197,14 @@ impl RiskPoolContract {
             .get(&(PROVIDER, provider.clone()))
             .unwrap_or((0i128, 0i128, env.ledger().timestamp()));
 
-        if provider_info.1 + amount < config.1 {
+        // After the amount is added, the provider's cumulative stake must meet min_provider_stake
+        // Give a clear error rather than generic InvalidInput
+        if provider_info.1.checked_add(amount).unwrap_or(i128::MAX) < config.1 {
+            return Err(ContractError::InvalidInput); // DepositBelowMinStake
+        }
+        // Sanity cap: a single deposit cannot exceed 10 billion XLM in stroops
+        const MAX_DEPOSIT: i128 = 100_000_000_000_000_000;
+        if amount > MAX_DEPOSIT {
             return Err(ContractError::InvalidInput);
         }
 
